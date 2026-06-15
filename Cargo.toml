@@ -6,5 +6,4 @@ edition = "2021"
 [dependencies]
 alloy = { version = "1", features = ["provider-http", "signer-local"] }
 rand = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
-futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "signal"] }
