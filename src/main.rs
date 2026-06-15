@@ -9,7 +9,7 @@ use futures::stream::{self, StreamExt};
 use tokio::sync::mpsc;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
 async fn check_one(provider: Arc<Provider<Http>>) -> Result<Option<(String, Address, String)>, Box<dyn Error + Send + Sync>> {
     // Generate a new random 32-byte private key
@@ -21,8 +21,10 @@ async fn check_one(provider: Arc<Provider<Http>>) -> Result<Option<(String, Addr
     let wallet: LocalWallet = priv_hex.parse()?;
     let address = wallet.address();
 
-    // Fetch balance
-    let balance = provider.get_balance(address, None).await?;
+    // Fetch balance with a timeout to avoid hanging on slow/dead RPC nodes
+    let balance = timeout(Duration::from_secs(15), provider.get_balance(address, None))
+        .await
+        .map_err(|_| "rpc timeout")??;
     if balance.is_zero() {
         return Ok(None);
     }
@@ -127,8 +129,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     println!("RPC(s)={} total={} concurrency={} save_file={}", rpc_urls.join(","), total, concurrency, save_path);
 
-    // Atomic counter for round-robin provider selection
+    // Atomic counter for round-robin provider selection and progress tracking
     let counter = Arc::new(AtomicUsize::new(0));
+    let checked = Arc::new(AtomicUsize::new(0));
 
     // Create a stream of tasks and run with a bounded concurrency
     let providers_clone = providers.clone();
@@ -144,17 +147,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let mut results = s.buffer_unordered(concurrency);
+    let log_interval = (total / 100).max(1000);
 
     while let Some(res) = results.next().await {
+        let n = checked.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % log_interval == 0 {
+            println!("progress: {}/{}", n, total);
+        }
         match res {
             Ok(Some((priv_hex, address, bal))) => {
-                let addr_str = format!("0x{}", hex::encode(address));
-                println!("{} -> {} ETH", addr_str, bal);
-                if let Err(e) = tx.send(priv_hex).await {
+                let addr_str = ethers::utils::to_checksum(&address, None);
+                println!("FOUND {} -> {} ETH", addr_str, bal);
+                let entry = format!("{} {} {} ETH", priv_hex, addr_str, bal);
+                if let Err(e) = tx.send(entry).await {
                     eprintln!("failed to send key to writer: {}", e);
                 }
             }
-            Ok(None) => { /* zero balance, skip */ }
+            Ok(None) => {}
             Err(e) => eprintln!("check_one failed: {}", e),
         }
     }
