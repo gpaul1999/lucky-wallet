@@ -1,4 +1,9 @@
-use ethers::prelude::*;
+use alloy::{
+    network::Ethereum,
+    primitives::{utils::format_ether, B256},
+    providers::{Provider, RootProvider},
+    signers::local::PrivateKeySigner,
+};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::env;
@@ -11,48 +16,57 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, timeout, Duration};
 
-async fn check_one(provider: Arc<Provider<Http>>) -> Result<Option<(String, Address, String)>, Box<dyn Error + Send + Sync>> {
-    // Generate a new random 32-byte private key
-    let mut key = [0u8; 32];
-    OsRng.fill_bytes(&mut key);
-    let priv_hex = format!("0x{}", hex::encode(key));
+type EthProvider = RootProvider<Ethereum>;
 
-    // Parse into a LocalWallet
-    let wallet: LocalWallet = priv_hex.parse()?;
-    let address = wallet.address();
+async fn check_one(provider: EthProvider) -> Result<Option<(String, String, String)>, Box<dyn Error + Send + Sync>> {
+    let mut key_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut key_bytes);
 
-    // Fetch balance with a timeout to avoid hanging on slow/dead RPC nodes
-    let balance = timeout(Duration::from_secs(15), provider.get_balance(address, None))
+    let signer = match PrivateKeySigner::from_bytes(&B256::from(key_bytes)) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+
+    let address = signer.address();
+    let priv_hex = format!("0x{}", alloy::primitives::hex::encode(key_bytes));
+
+    let balance = timeout(Duration::from_secs(15), provider.get_balance(address))
         .await
         .map_err(|_| "rpc timeout")??;
+
     if balance.is_zero() {
         return Ok(None);
     }
-    let eth_balance = ethers::utils::format_ether(balance);
-    Ok(Some((priv_hex, address, eth_balance)))
+
+    let eth_balance = format_ether(balance);
+    let addr_str = address.to_string();
+
+    Ok(Some((priv_hex, addr_str, eth_balance)))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Read RPC URLs: prefer RPC_URLS (comma-separated), fall back to RPC_URL, default to local node
-    let rpc_urls_str = env::var("RPC_URLS").ok().or_else(|| env::var("RPC_URL").ok()).unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
+    let rpc_urls_str = env::var("RPC_URLS")
+        .ok()
+        .or_else(|| env::var("RPC_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
+
     let rpc_urls: Vec<String> = rpc_urls_str
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Build provider pool
-    let mut provs = Vec::new();
+    let mut provs: Vec<EthProvider> = Vec::new();
     for url in &rpc_urls {
-        provs.push(Provider::<Http>::try_from(url.as_str())?);
+        provs.push(RootProvider::new_http(url.parse()?));
     }
     let providers = Arc::new(provs);
+
     if providers.is_empty() {
         return Err("no rpc providers configured".into());
     }
 
-    // Configuration: total work and concurrency
     let workers: usize = env::var("WORKERS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let per_worker: usize = env::var("PER_WORKER").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let total_env: Option<usize> = env::var("TOTAL").ok().and_then(|s| s.parse().ok());
@@ -65,11 +79,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let concurrency: usize = env::var("CONCURRENCY").ok().and_then(|s| s.parse().ok()).unwrap_or(256);
 
-    // Save file and writer channel
     let save_path = env::var("SAVE_FILE").unwrap_or_else(|_| "found_keys.txt".to_string());
     let (tx, mut rx) = mpsc::channel::<String>(4096);
 
-    // Spawn writer task: batch writes and flush periodically
     let save_path_clone = save_path.clone();
     let writer = tokio::spawn(async move {
         const BATCH_SIZE: usize = 64;
@@ -85,11 +97,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         let mut buffer: Vec<String> = Vec::with_capacity(BATCH_SIZE);
         loop {
-            // wait for at least one item, or exit if channel closed
             match rx.recv().await {
                 Some(k) => buffer.push(k),
                 None => {
-                    // channel closed, flush remaining
                     if !buffer.is_empty() {
                         if let Err(e) = file.write_all((buffer.join("\n") + "\n").as_bytes()).await {
                             eprintln!("writer: failed to write final batch: {}", e);
@@ -100,13 +110,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
 
-            // try to collect a small batch or wait a short time
             let start = tokio::time::Instant::now();
             while buffer.len() < BATCH_SIZE {
                 if let Ok(item) = rx.try_recv() {
                     buffer.push(item);
                 } else {
-                    // brief wait to allow more items to accumulate
                     if start.elapsed() >= Duration::from_millis(FLUSH_INTERVAL_MS) {
                         break;
                     }
@@ -114,7 +122,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
 
-            // write batch
             if !buffer.is_empty() {
                 if let Err(e) = file.write_all((buffer.join("\n") + "\n").as_bytes()).await {
                     eprintln!("writer: failed to write batch: {}", e);
@@ -129,11 +136,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     println!("RPC(s)={} total={} concurrency={} save_file={}", rpc_urls.join(","), total, concurrency, save_path);
 
-    // Atomic counter for round-robin provider selection and progress tracking
     let counter = Arc::new(AtomicUsize::new(0));
     let checked = Arc::new(AtomicUsize::new(0));
 
-    // Create a stream of tasks and run with a bounded concurrency
     let providers_clone = providers.clone();
     let counter_clone = counter.clone();
     let s = stream::iter(0..total).map(move |_| {
@@ -142,7 +147,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         async move {
             let idx = ctr.fetch_add(1, Ordering::Relaxed);
             let provider = provs[idx % provs.len()].clone();
-            check_one(Arc::new(provider)).await
+            check_one(provider).await
         }
     });
 
@@ -155,8 +160,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("progress: {}/{}", n, total);
         }
         match res {
-            Ok(Some((priv_hex, address, bal))) => {
-                let addr_str = ethers::utils::to_checksum(&address, None);
+            Ok(Some((priv_hex, addr_str, bal))) => {
                 println!("FOUND {} -> {} ETH", addr_str, bal);
                 let entry = format!("{} {} {} ETH", priv_hex, addr_str, bal);
                 if let Err(e) = tx.send(entry).await {
@@ -168,7 +172,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // Close writer and wait for it to finish
     drop(tx);
     if let Err(e) = writer.await {
         eprintln!("writer task failed: {}", e);

@@ -1,11 +1,10 @@
 [package]
 name = "lucky-wallet"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-ethers = { version = "2.0", features = ["rustls"] }
+alloy = { version = "1", features = ["provider-http", "signer-local"] }
 rand = "0.8"
-hex = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
 futures = "0.3"
